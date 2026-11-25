@@ -8,6 +8,7 @@ from uuid import uuid4
 import cv2
 import numpy as np
 
+from lib.preprocesamiento import preprocesar
 from lib.schemas import ClassifyResult, DetectResult, DogDetection
 from lib.services.classifier_service import ClassifierService
 
@@ -36,6 +37,8 @@ class DetectionService:
         self.yolo_model_name = yolo_model
         self.conf_threshold = conf_threshold
         self.dog_class_id = dog_class_id
+        # Detector YOLO: se carga una sola vez, en la primera llamada
+        self._detector = None
 
     @staticmethod
     def _clip_xyxy(
@@ -64,27 +67,39 @@ class DetectionService:
 
     def detect_dogs(self, image: np.ndarray) -> list[tuple[tuple[int, int, int, int], float]]:
         """
-        Detecta todos los perros presentes en la imagen usando un modelo YOLO
-        pre-entrenado (ej: YOLOv8n via ultralytics). No es necesario entrenar
-        el detector.
-
-        Sugerencias:
-          - self.yolo_model_name, self.conf_threshold y self.dog_class_id
-            (clase 'dog' = 16 en COCO) vienen de la configuracion (.env).
-          - Debe funcionar con un perro, multiples perros y escenas complejas.
-
-        Retorna una lista de ((x1, y1, x2, y2), confidence) en pixeles.
+        Detecta los perros de una imagen BGR uint8 con YOLO preentrenado en COCO (sin entrenar).
+        Filtra por la clase perro (YOLO_DOG_CLASS_ID) y por confianza (YOLO_CONF_THRESHOLD).
+        Devuelve [((x1, y1, x2, y2), confianza), ...] en píxeles enteros; lista vacía si no hay perros.
         """
-        raise NotImplementedError("Etapa 3: implementar detect_dogs")
+        if self._detector is None:
+            from ultralytics import YOLO
+
+            self._detector = YOLO(self.yolo_model_name)  # descarga los pesos en el primer uso
+            logger.info("Detector YOLO cargado: %s", self.yolo_model_name)
+
+        resultado = self._detector(
+            image, classes=[self.dog_class_id], conf=self.conf_threshold, verbose=False
+        )[0]
+        detecciones = []
+        for caja, confianza in zip(resultado.boxes.xyxy.cpu().numpy(), resultado.boxes.conf.cpu().numpy()):
+            x1, y1, x2, y2 = (int(round(v)) for v in caja)
+            detecciones.append(((x1, y1, x2, y2), float(confianza)))
+        return detecciones
 
     def classify_detected_dog(self, crop: np.ndarray) -> tuple[str, float]:
         """
-        Clasifica la raza del recorte de un perro detectado usando el modelo
-        entrenado en la Etapa 2 (self.classifier.load_model()).
-
-        El recorte llega en BGR (OpenCV). Retorna (raza, score).
+        Clasifica el recorte BGR de un perro con el modelo activo de la Etapa 2, usando el mismo
+        preprocesamiento del entrenamiento. Devuelve (raza, probabilidad softmax de esa raza).
         """
-        raise NotImplementedError("Etapa 3: implementar classify_detected_dog")
+        import torch
+
+        modelo = self.classifier.load_model()
+        x = preprocesar(crop, self.classifier.image_size).unsqueeze(0)
+        modelo.eval()
+        with torch.no_grad():
+            probas = torch.softmax(modelo(x), dim=1)[0].numpy()
+        indice = int(probas.argmax())
+        return modelo.razas[indice], float(probas[indice])
 
     # ------------------------------------------------------------------
     # Orquestacion provista
