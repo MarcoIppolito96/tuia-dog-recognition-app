@@ -14,6 +14,7 @@ Dentro de Docker (con `docker compose up -d` corriendo):
 from __future__ import annotations
 
 import argparse
+import csv
 import os
 import sys
 from pathlib import Path
@@ -55,6 +56,31 @@ def main() -> None:
         classifier.set_active_model(settings.embedding_model)
         extractor = classifier.extract_custom_embedding
     similarity.extract_embedding = extractor  # type: ignore[method-assign]
+
+    # Splits redefinidos en 1-pre-processing.ipynb (sin duplicados ni fuga entre splits).
+    # Si el archivo existe se indexa el split pedido desde ahí; si no, las carpetas originales.
+    splits_csv = settings.data_path / "splits" / "splits.csv"
+    if splits_csv.is_file():
+        with open(splits_csv, encoding="utf-8") as f:
+            filas = [fila for fila in csv.DictReader(f) if fila["split"] == args.split]
+        por_raza: dict[str, int] = {}
+        for fila in filas:
+            raza = fila["raza"]
+            if args.limit and por_raza.get(raza, 0) >= args.limit:
+                continue
+            similarity.index_image(
+                str(settings.dataset_path / fila["ruta"]),
+                raza,
+                {"split": args.split, "model": settings.embedding_model},
+            )
+            por_raza[raza] = por_raza.get(raza, 0) + 1
+        for raza in sorted(por_raza):
+            print(f"{raza}: {por_raza[raza]} imagenes indexadas")
+        print(
+            f"Total: {sum(por_raza.values())} embeddings almacenados "
+            f"(modelo: {settings.embedding_model}, splits: {splits_csv})"
+        )
+        return
 
     root = settings.dataset_path / args.split
     if not root.is_dir():
