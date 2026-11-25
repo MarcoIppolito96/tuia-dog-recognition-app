@@ -76,6 +76,27 @@ def preprocesar(
     return a_tensor(rgb)
 
 
+def aumentacion_entrenamiento(image_size: int):
+    """Data augmentation para train (nunca para valid, test ni el conjunto independiente).
+
+    Se aplica sobre la imagen RGB uint8 ya cuadrada (ver `preprocesar`). Los rangos son
+    moderados para no cambiar la raza aparente: sin flips verticales, sin rotaciones de 90°
+    y sin cambios de tono que alteren el color del pelaje.
+    """
+    import albumentations as A  # solo hace falta al entrenar
+
+    return A.Compose([
+        # Encuadre: simula recortes de YOLO más o menos ajustados al perro
+        A.RandomResizedCrop(size=(image_size, image_size), scale=(0.7, 1.0), ratio=(0.8, 1.25), p=0.5),
+        A.HorizontalFlip(p=0.5),
+        # Inclinación leve de cámara; el borde se rellena igual que en `a_rgb_cuadrada`
+        A.Rotate(limit=15, border_mode=cv2.BORDER_CONSTANT, fill=COLOR_RELLENO, p=0.5),
+        A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
+        A.GaussianBlur(blur_limit=(3, 5), p=0.2),
+        A.GaussNoise(std_range=(0.02, 0.06), p=0.2),
+    ])
+
+
 def desnormalizar(tensor: torch.Tensor) -> np.ndarray:
     """Inversa de a_tensor, para visualizar: tensor (3, H, W) → RGB uint8 (H, W, 3)."""
     x = tensor.detach().cpu().numpy().transpose(1, 2, 0)
