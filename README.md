@@ -47,14 +47,17 @@ tuia-dog-recognition-app/
 │       ├── config.py            # Configuración vía .env
 │       ├── files.py
 │       ├── schemas.py
+│       ├── preprocesamiento.py      # Preprocesamiento y augmentation compartidos (notebooks y app)
+│       ├── models/
+│       │   └── clasificadores.py    # Arquitecturas del Modelo A (ResNetRazas) y del Modelo B (CNNPropia)
 │       ├── evaluation/
 │       │   └── metrics.py       # NDCG@k, precision/recall/F1, specificity
 │       ├── visualization/
 │       │   └── draw.py          # Dibujo de bounding boxes
 │       ├── services/
-│       │   ├── similarity_service.py   # ⚠️ Etapa 1: funciones a implementar
-│       │   ├── classifier_service.py   # ⚠️ Etapa 2: funciones a implementar
-│       │   ├── detection_service.py    # ⚠️ Etapa 3: funciones a implementar
+│       │   ├── similarity_service.py   # Etapa 1: búsqueda por similitud
+│       │   ├── classifier_service.py   # Etapa 2: entrenamiento, evaluación y embeddings de los modelos
+│       │   ├── detection_service.py    # Etapa 3: detección con YOLO y clasificación de recortes
 │       │   └── task_manager.py
 │       └── storage/
 │           ├── base.py
@@ -62,10 +65,11 @@ tuia-dog-recognition-app/
 │           └── pgvector_store.py       # Base vectorial en PostgreSQL + pgvector
 ├── scripts/
 │   ├── download_dataset.py      # Descarga el dataset de Kaggle
-│   ├── build_index.py           # Indexa el dataset en la base vectorial
+│   ├── build_index.py           # Indexa el dataset en la base vectorial (usa data/splits/splits.csv)
 │   └── train_classifier.py      # Entrena/evalúa el clasificador (alternativa local a 2-train.ipynb)
 ├── data/
 │   ├── dataset/                 # 70 Dog Breeds Image Dataset, no se versiona
+│   ├── splits/splits.csv        # Splits train/valid/test definidos en 1-pre-processing.ipynb
 │   └── embeddings.json          # Base vectorial JSON (si USE_PGVECTOR=false)
 ├── models/                      # Checkpoints entrenados (.pth / .onnx), no se versionan
 ├── output/                      # Imágenes subidas y resultados, no se versiona
@@ -278,9 +282,9 @@ No hardcodeen parámetros: configúrenlos mediante `.env`.
 - Funciones auxiliares de evaluación (`lib/evaluation/metrics.py`) y de visualización (`lib/visualization/draw.py`).
 - Frontend Gradio con una pestaña por etapa: Etapa 1 (imagen consultada, Top-K similares, raza predicha y selección de modelo), Etapa 2 (raza y score con el modelo entrenado) y Etapa 3 (bounding boxes, razas y scores).
 
-### A implementar por el grupo
+### Implementado por el grupo
 
-Estas funciones hoy lanzan `NotImplementedError`:
+Funciones completadas (ninguna lanza `NotImplementedError`):
 
 | Etapa | Función | Archivo |
 |-------|---------|---------|
@@ -296,6 +300,27 @@ Estas funciones hoy lanzan `NotImplementedError`:
 En las Etapas 1 y 3 el trabajo se limita a completar las funciones. En la Etapa 2, además, el grupo entrena sus propios modelos (Modelo A: fine-tuning de ResNet18/ResNet50; Modelo B: CNN propia, **ambos obligatorios**) y hace un estudio de resultados.
 
 Ver el contrato de cada función, recomendaciones y errores frecuentes en [ENUNCIADO.md](ENUNCIADO.md#24-funciones-a-implementar).
+
+
+### Pipeline implementado
+
+Todas las etapas usan el mismo preprocesamiento (`src/lib/preprocesamiento.py`): la imagen llega en
+BGR (OpenCV), se convierte a RGB, se rellena hasta hacerla cuadrada (sin deformarla ni recortarla),
+se lleva a 224×224 y se normaliza con la media y el desvío de ImageNet. Las notebooks y los
+servicios importan este módulo, por lo que entrenamiento e inferencia procesan las imágenes igual.
+
+1. **Etapa 1 (búsqueda por similitud).** `extract_embedding` obtiene un vector de 512 dimensiones
+   con una ResNet18 preentrenada en ImageNet sin la capa de clasificación, normalizado L2. La
+   galería (`train`, 6.001 imágenes) se indexa en PostgreSQL + pgvector. Para cada consulta se
+   recuperan los 10 vecinos más similares (coseno) y la raza se decide por voto ponderado por
+   similitud. El score es la similitud media de los vecinos de la raza ganadora; si es menor que
+   `SIMILARITY_THRESHOLD` (0,78) la respuesta es `unknown`.
+2. **Etapa 2 (clasificación).** El Modelo A (ResNet18 ajustada a las 70 razas) clasifica la imagen
+   completa y devuelve la raza con su probabilidad (softmax). Los modelos guardan la lista de razas
+   dentro del checkpoint, así que la app no depende del dataset para traducir la predicción.
+3. **Etapa 3 (detección).** YOLOv8n preentrenado en COCO detecta los perros (clase 16, confianza
+   mínima 0,25). Cada caja se recorta y se clasifica con el Modelo A usando el mismo
+   preprocesamiento.
 
 ### Orden de trabajo sugerido
 
@@ -315,36 +340,122 @@ Se pueden entregar commiteadas en el repositorio o en Google Colab, con el link 
 
 ## Dataset
 
-Documentar en la entrega final:
+Detalle completo, con gráficos y ejemplos, en `1-pre-processing.ipynb`.
 
-- Splits utilizados y cantidad de imágenes por raza en cada uno
-- Reglas de filtrado y calidad, con la cantidad de imágenes descartadas por regla
-- Conjunto independiente de evaluación: fuente, licencia, razas e imágenes por raza, y link de descarga
-- Preprocesamiento y data augmentation aplicados
+- **Dataset:** 70 Dog Breeds Image Dataset (Kaggle, licencia CC0), 9.346 imágenes JPEG de 224×224.
+  Se corrige el nombre de la carpeta `American  Spaniel` (doble espacio) en `valid`.
+- **Control de calidad** (aplicado a todos los splits):
+
+  | Regla | Descartadas |
+  |---|---|
+  | Archivo corrupto | 0 |
+  | Resolución menor a 112 px | 0 |
+  | Borrosa (varianza del Laplaciano < 30) | 5 |
+  | Misma foto en carpetas de razas distintas | 44 |
+  | Duplicado o casi duplicado (coseno > 0,95 entre embeddings) | 723 |
+  | **Total** | **772 (8,3%)** |
+
+  Los splits originales tenían fuga de datos: el 17% de `valid` y de `test` tenía una copia en
+  `train`.
+- **Splits:** las 8.574 imágenes restantes se dividen 70/15/15, estratificado por raza y con
+  semilla 42: train 6.001, valid 1.286 y test 1.287 (entre 11 y 31 imágenes por raza en valid y
+  test). Quedan en `data/splits/splits.csv`, que usan las notebooks, `train_classifier` y
+  `scripts/build_index.py`.
+- **Conjunto independiente:** 162 imágenes de 56 razas (Oxford-IIIT Pet, CC BY-SA 4.0, y Stanford
+  Dogs, uso académico), 10 escenas con varios perros, personas u objetos, y 19 imágenes sin perros
+  (incluye 15 gatos). Se descartaron las imágenes con un casi duplicado en el dataset. Fuentes y
+  licencias en `independiente.csv` y en la sección 13 de `1-pre-processing.ipynb`.
+  Link de solo lectura: https://drive.google.com/drive/folders/1qWz0Yv6uGes9m9oyMNONr8NX6CvlzQD0
+- **Data augmentation** (solo `train`): recorte aleatorio (70–100% del área), flip horizontal,
+  rotación de ±15°, brillo y contraste de ±20%, desenfoque y ruido leves.
 
 ## Modelos y entrenamiento
 
-Completar en la entrega final:
+Detalle en `2-train.ipynb` (ejecutada en Kaggle con GPU T4).
 
-- Modelo de embeddings baseline (Etapa 1) y justificación
-- Modelo A (fine-tuning) y Modelo B (CNN propia): arquitectura, estrategia y justificación
-- Hiperparámetros y proceso de entrenamiento
-- Detector YOLO utilizado y `YOLO_CONF_THRESHOLD` elegido
-- Umbral de similitud elegido y cómo se calibró
-- Links públicos de descarga de los checkpoints
+- **Embeddings de la Etapa 1 (baseline):** ResNet18 de ImageNet sin la capa final (512 dimensiones,
+  igual a `EMBEDDING_DIM`). Se eligió por su buen rendimiento sin entrenamiento y porque es liviana
+  para CPU.
+- **Modelo A (`resnet18_finetuned`):** ResNet18 preentrenada con una capa final de 70 salidas. Se
+  compararon *feature extraction* (87,1% en valid), *fine-tuning* completo con learning rates
+  diferenciados (1e-4 en la red preentrenada y 1e-3 en la capa nueva, 91,0%) y fine-tuning con
+  *class weights* (91,1%, elegido).
+- **Modelo B (`cnn_custom`):** CNN propia de 5 bloques convolucionales (dos convoluciones 3×3 con
+  BatchNorm y ReLU, y MaxPool), global average pooling, capa de embedding de 512 y dropout 0,3
+  (5,0 M de parámetros). Se compararon 3 experimentos (4 bloques sin augmentation, 4 bloques con
+  augmentation y 5 bloques con augmentation).
+- **Hiperparámetros:** AdamW (weight decay 1e-4), scheduler coseno, batch size 64, label smoothing
+  0,1, early stopping por accuracy en valid (se guarda la mejor época). Modelo A: hasta 10 épocas;
+  Modelo B: 30 épocas.
+- **Detector:** YOLOv8n preentrenado en COCO, sin entrenar. `YOLO_CONF_THRESHOLD = 0.25`: con 0,15
+  no detecta más perros y con 0,40 pierde perros lejanos sin eliminar falsos positivos.
+- **Umbral de similitud:** `SIMILARITY_THRESHOLD = 0.78`, percentil 1 del score de las
+  predicciones correctas en valid. Rechaza 17 de 19 imágenes sin perro y el 1% de las consultas
+  de test.
+- **Configuración final:** `EMBEDDING_MODEL=baseline`, `EMBEDDING_DIM=512`, `TOP_K=10`; la app
+  clasifica con el Modelo A.
+- **Checkpoints** (link público de solo lectura): https://drive.google.com/drive/folders/1oszseGN2kq3BSq7K7fjzWvzhb_ryYmoc
+  (`resnet18_finetuned.pth` y `cnn_custom.pth`, a copiar en `models/`).
 
 ## Resultados
 
-Completar en la entrega final:
+**Etapa 1: búsqueda por similitud** (galería `train`, TOP_K = 10)
 
-- Etapa 1: NDCG@10 por modelo de embeddings, sobre `test` y sobre el conjunto independiente
-- Etapa 2: accuracy, precision, recall, specificity y F1 de ambos modelos, y matriz de confusión
-- Comparación entre enfoques (búsqueda por similitud vs. clasificación supervisada; fine-tuning vs. CNN propia)
-- Análisis de errores (falsos positivos y falsos negativos)
+| Embeddings | NDCG@10 test | NDCG@10 independiente | Accuracy test | Accuracy independiente |
+|---|---|---|---|---|
+| Baseline (ImageNet) | 0,819 | 0,698 | 88,7% | 77,8% |
+| Modelo A | 0,880 | 0,630 | 90,8% | 65,4% |
+| Modelo B | 0,560 | 0,161 | 63,8% | 21,0% |
+
+Cosine y l2 dan los mismos resultados porque los embeddings tienen norma 1.
+
+**Etapa 2: clasificación** (métricas macro)
+
+| Métrica | Modelo A (ResNet18 fine-tuned) | Modelo B (CNN propia) |
+|---|---|---|
+| Accuracy (test) | 89,8% | 65,4% |
+| Precision / Recall / F1 (test) | 90,4% / 89,9% / 89,8% | 67,3% / 65,2% / 65,3% |
+| Specificity (test) | 99,85% | 99,5% |
+| Accuracy (independiente) | 59,9% | 17,3% |
+| Parámetros / tamaño | 11,2 M / 42,8 MB | 5,0 M / 19,1 MB |
+| Inferencia en CPU | 29,9 ms/imagen | 46,2 ms/imagen |
+
+**Conclusiones**
+
+- La app clasifica con el **Modelo A** y busca con los **embeddings del baseline**: los del Modelo A
+  son mejores en test, pero el baseline es más robusto con fotos de otras fuentes, que es lo que
+  recibe la app.
+- La CNN propia rinde ≈24 puntos menos: no tiene preentrenamiento, la tarea es de grano fino y hay
+  ≈86 imágenes por raza.
+- Los errores se concentran en razas muy parecidas (Lhasa/Shih-Tzu, Labradoodle/Cockapoo, American
+  Hairless/Mex Hairless) y en etiquetas erróneas del dataset (la carpeta "Bulldog" contiene Boston
+  Terriers y Bulldogs Franceses).
+- **Detección:** 8 de 10 escenas con el conteo de perros exacto (incluye perros superpuestos y
+  escenas con personas u objetos). Sin falsos positivos con gatos; sí con un zorro y un peluche con
+  forma de perro. Fallos con cachorros amontonados y con perros lejanos.
 
 ## Problemas encontrados y soluciones
 
-Completar en la entrega final.
+- **Fuga de datos en el dataset original:** el 17% de valid y test tenía copias en train. Se
+  deduplicó con embeddings y se redefinieron los splits.
+- **`build_index.py` indexaba las carpetas originales:** con los splits nuevos, eso habría
+  indexado imágenes de nuestro test. Se modificó para leer `data/splits/splits.csv`.
+- **Caída fuera del dominio:** el Modelo A baja de 89,8% en test a 59,9% en el conjunto
+  independiente. Se diagnosticó que el modelo nunca vio bandas de relleno, porque todas las
+  imágenes del dataset son cuadradas: con recorte central sube a 72,2%. Se mantuvo el relleno
+  (necesario para los recortes de YOLO) y se propone como mejora entrenar con relleno y encuadres
+  aleatorios.
+- **Sin GPU en Colab:** el entrenamiento se hizo en Kaggle. La Etapa 1 dio los mismos resultados en
+  ambos entornos.
+
+## Cómo reproducir la entrega
+
+1. Descargar el dataset de Kaggle y descomprimir `train/`, `valid/` y `test/` en `data/dataset/`.
+2. Descargar los checkpoints del link de la sección *Modelos y entrenamiento* y copiarlos en
+   `models/`.
+3. `docker compose build` y `docker compose up -d`.
+4. Indexar la galería: `docker compose exec backend python /scripts/build_index.py --split train`.
+5. Abrir el frontend en `http://localhost:8080`.
 
 ## Notas importantes
 
@@ -367,6 +478,6 @@ docker compose build
 docker compose up
 ```
 
-**Fecha de entrega:** a definir por la cátedra. Solo se consideran los commits hasta esa fecha y hora; se recomienda trabajar de forma incremental.
+**Fecha de entrega:** 27/11/2026, 23:59. Solo se consideran los commits hasta esa fecha y hora.
 
 El detalle del contenido del PR, la plantilla de descripción y el checklist están en [ENUNCIADO.md](ENUNCIADO.md#8-entrega-pull-request).
